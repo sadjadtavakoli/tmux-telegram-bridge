@@ -1,4 +1,4 @@
-# Claude Telegram Bridge
+# Claude (tmux) Telegram Bridge
 
 Remote control your Claude Code CLI session from your phone via Telegram.
 Get push notifications when Claude needs your input, reply by voice dictation.
