@@ -48,16 +48,26 @@ class PromptDetector:
         r"(?:Allow|Deny)",
         r"\(y\)es.*\(n\)o",
         r"\[y/n\]",
-        r"❯\s*$",
-        r">\s*$",
+        r"^❯\s*$",
         r"\?\s*$",
     ]
 
     @staticmethod
     def extract_context(content: str, max_lines: int = 20) -> str:
-        """Extract the last N lines of content as context."""
+        """Extract the last N lines of content, cleaned of terminal noise."""
         all_lines = content.strip().split("\n")
-        return "\n".join(all_lines[-max_lines:])
+        tail = all_lines[-max_lines:]
+        cleaned = []
+        for line in tail:
+            stripped = line.strip()
+            # Skip lines that are just horizontal rules (─, ━, ═, -)
+            if stripped and all(c in "─━═─-—" for c in stripped):
+                continue
+            # Skip empty lines
+            if not stripped:
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned)
 
     @staticmethod
     def has_prompt(lines: list[str]) -> bool:
@@ -250,7 +260,7 @@ async def poll_tmux(app) -> None:
         content = capture_pane()
         context_text = _detector.update(content)
         if context_text:
-            msg = f"Claude needs your input:\n---\n{context_text}\n---\nReply to respond."
+            msg = f"Claude needs your input:\n\n{context_text}"
             if len(msg) > 4000:
                 msg = msg[-4000:]
             await app.bot.send_message(chat_id=CHAT_ID, text=msg)
