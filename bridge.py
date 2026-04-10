@@ -111,8 +111,11 @@ def authorized(update: Update) -> bool:
 
 
 def send_tmux_keys(keys: list[str], target: str | None = None) -> None:
-    """Send a sequence of tmux key names (e.g. ['Down', 'Enter'])."""
-    subprocess.run(["tmux", "send-keys", "-t", target or current_target] + keys)
+    """Send a sequence of tmux key names one at a time with a delay between them."""
+    t = target or current_target
+    for key in keys:
+        subprocess.run(["tmux", "send-keys", "-t", t, key])
+        time.sleep(0.15)
 
 
 # Claude Code uses interactive menus (arrow keys + Enter).
