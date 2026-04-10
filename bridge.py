@@ -3,9 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
 import re
+import subprocess
+import sys
 import time
+
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 class PromptDetector:
@@ -59,3 +67,111 @@ class PromptDetector:
                 if re.search(pattern, line):
                     return True
         return False
+
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+TMUX_TARGET = os.getenv("TMUX_TARGET", "claude:0")
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
+QUIESCENCE_SECONDS = float(os.getenv("QUIESCENCE_SECONDS", "3"))
+
+
+def capture_pane(target: str = TMUX_TARGET, history: int = 200) -> str:
+    """Capture the visible content of a tmux pane."""
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{history}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def send_keys(text: str, target: str = TMUX_TARGET) -> None:
+    """Send keystrokes to a tmux pane."""
+    subprocess.run(["tmux", "send-keys", "-t", target, "--", text, "Enter"])
+
+
+def authorized(update: Update) -> bool:
+    """Only allow messages from the configured chat ID."""
+    return update.effective_chat.id == CHAT_ID
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Relay incoming Telegram messages to the tmux pane."""
+    if not authorized(update):
+        return
+    send_keys(update.message.text)
+    await update.message.reply_text("Sent to Claude.")
+
+
+async def handle_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send current pane content to the user."""
+    if not authorized(update):
+        return
+    content = capture_pane(history=40)
+    text = content.strip() or "(empty)"
+    if len(text) > 4000:
+        text = text[-4000:]
+    await update.message.reply_text(text)
+
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report whether Claude is working or waiting."""
+    if not authorized(update):
+        return
+    content = capture_pane()
+    lines = content.strip().split("\n")
+    tail = lines[-5:] if len(lines) >= 5 else lines
+    if PromptDetector.has_prompt(tail):
+        await update.message.reply_text("Waiting for your input.")
+    else:
+        await update.message.reply_text("Claude is working...")
+
+
+async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shut down the bridge."""
+    if not authorized(update):
+        return
+    await update.message.reply_text("Bridge shutting down.")
+    sys.exit(0)
+
+
+async def poll_tmux(app) -> None:
+    """Poll tmux pane and send Telegram notifications when prompts detected."""
+    detector = PromptDetector(quiescence_seconds=QUIESCENCE_SECONDS)
+    await app.bot.send_message(chat_id=CHAT_ID, text="Bridge connected. Monitoring Claude Code session.")
+    while True:
+        content = capture_pane()
+        context_text = detector.update(content)
+        if context_text:
+            msg = f"Claude needs your input:\n---\n{context_text}\n---\nReply to respond."
+            if len(msg) > 4000:
+                msg = msg[-4000:]
+            await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def post_init(app) -> None:
+    """Start the tmux poller after the Telegram bot initializes."""
+    app.create_task(poll_tmux(app))
+
+
+def main() -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Error: Set BOT_TOKEN and CHAT_ID in .env")
+        sys.exit(1)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("screen", handle_screen))
+    app.add_handler(CommandHandler("status", handle_status))
+    app.add_handler(CommandHandler("stop", handle_stop))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print(f"Bridge starting. Monitoring tmux target: {TMUX_TARGET}")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
