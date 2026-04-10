@@ -19,6 +19,12 @@ class PromptDetector:
     ]
 
     @staticmethod
+    def extract_context(content: str, max_lines: int = 20) -> str:
+        """Extract the last N lines of content as context."""
+        all_lines = content.strip().split("\n")
+        return "\n".join(all_lines[-max_lines:])
+
+    @staticmethod
     def has_prompt(lines: list[str]) -> bool:
         """Check if any lines match a known prompt pattern."""
         for line in lines:
