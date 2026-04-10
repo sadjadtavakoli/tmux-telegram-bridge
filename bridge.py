@@ -110,13 +110,42 @@ def authorized(update: Update) -> bool:
     return update.effective_chat.id == CHAT_ID
 
 
-# Single-char inputs that should be sent WITHOUT Enter (for permission prompts)
-SINGLE_KEY_INPUTS = {"y", "n", "a", "d", "1", "2", "3", "4", "5"}
+def send_tmux_keys(keys: list[str], target: str | None = None) -> None:
+    """Send a sequence of tmux key names (e.g. ['Down', 'Enter'])."""
+    subprocess.run(["tmux", "send-keys", "-t", target or current_target] + keys)
 
 
-def send_keys_raw(keys: str, target: str | None = None) -> None:
-    """Send raw keystrokes without Enter (for single-key prompts)."""
-    subprocess.run(["tmux", "send-keys", "-t", target or current_target, "--", keys])
+# Claude Code uses interactive menus (arrow keys + Enter).
+# The first option is pre-selected, so Enter = accept first option.
+# Map voice-friendly words to tmux key sequences.
+MENU_MAPPINGS = {
+    # Accept first option (usually "Allow once")
+    "yes": (["Enter"], "Enter (accept)"),
+    "yeah": (["Enter"], "Enter (accept)"),
+    "yep": (["Enter"], "Enter (accept)"),
+    "allow": (["Enter"], "Enter (accept)"),
+    "ok": (["Enter"], "Enter (accept)"),
+    "okay": (["Enter"], "Enter (accept)"),
+    "accept": (["Enter"], "Enter (accept)"),
+    "confirm": (["Enter"], "Enter (accept)"),
+    "y": (["Enter"], "Enter (accept)"),
+    # Second option (usually "Allow always" or similar)
+    "always": (["Down", "Enter"], "Down + Enter (2nd option)"),
+    "allow always": (["Down", "Enter"], "Down + Enter (2nd option)"),
+    # Deny / last option
+    "no": (["Escape"], "Escape (deny/cancel)"),
+    "nope": (["Escape"], "Escape (deny/cancel)"),
+    "deny": (["Escape"], "Escape (deny/cancel)"),
+    "cancel": (["Escape"], "Escape (deny/cancel)"),
+    "n": (["Escape"], "Escape (deny/cancel)"),
+    # Navigation keys
+    "up": (["Up"], "Up arrow"),
+    "down": (["Down"], "Down arrow"),
+    "enter": (["Enter"], "Enter"),
+    "escape": (["Escape"], "Escape"),
+    "esc": (["Escape"], "Escape"),
+    "tab": (["Tab"], "Tab"),
+}
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -125,19 +154,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     text = update.message.text.strip()
     lower = text.lower()
-    # Map common voice-dictated words to single keys
-    if lower in ("yes", "yeah", "yep", "allow"):
-        send_keys_raw("y")
-        await update.message.reply_text("Sent: y")
-    elif lower in ("no", "nope", "deny"):
-        send_keys_raw("n")
-        await update.message.reply_text("Sent: n")
-    elif lower in ("always", "allow always"):
-        send_keys_raw("a")
-        await update.message.reply_text("Sent: a (always allow)")
-    elif len(text) == 1 and lower in SINGLE_KEY_INPUTS:
-        send_keys_raw(text)
-        await update.message.reply_text(f"Sent: {text}")
+
+    # Check for menu/key mappings
+    if lower in MENU_MAPPINGS:
+        keys, label = MENU_MAPPINGS[lower]
+        send_tmux_keys(keys)
+        await update.message.reply_text(f"Sent: {label}")
+    # Numeric selection: "1" = Enter, "2" = Down+Enter, "3" = Down+Down+Enter
+    elif lower in ("1", "2", "3", "4", "5"):
+        n = int(lower)
+        keys = ["Down"] * (n - 1) + ["Enter"]
+        send_tmux_keys(keys)
+        label = f"Option {n}" if n > 1 else "Enter (1st option)"
+        await update.message.reply_text(f"Sent: {label}")
     else:
         # Regular message — send with Enter for Claude's input prompt
         send_keys(text)
