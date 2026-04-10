@@ -73,24 +73,36 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
-TMUX_TARGET = os.getenv("TMUX_TARGET", "claude:0")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 QUIESCENCE_SECONDS = float(os.getenv("QUIESCENCE_SECONDS", "3"))
 
+# Mutable target — changed via /watch command
+current_target = os.getenv("TMUX_TARGET", "claude:1")
 
-def capture_pane(target: str = TMUX_TARGET, history: int = 200) -> str:
+
+def list_panes() -> str:
+    """List all tmux panes with their current commands."""
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}  #{pane_current_command}  #{window_name}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def capture_pane(target: str | None = None, history: int = 200) -> str:
     """Capture the visible content of a tmux pane."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{history}"],
+        ["tmux", "capture-pane", "-t", target or current_target, "-p", "-S", f"-{history}"],
         capture_output=True,
         text=True,
     )
     return result.stdout
 
 
-def send_keys(text: str, target: str = TMUX_TARGET) -> None:
+def send_keys(text: str, target: str | None = None) -> None:
     """Send keystrokes to a tmux pane."""
-    subprocess.run(["tmux", "send-keys", "-t", target, "--", text, "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", target or current_target, "--", text, "Enter"])
 
 
 def authorized(update: Update) -> bool:
@@ -98,12 +110,38 @@ def authorized(update: Update) -> bool:
     return update.effective_chat.id == CHAT_ID
 
 
+# Single-char inputs that should be sent WITHOUT Enter (for permission prompts)
+SINGLE_KEY_INPUTS = {"y", "n", "a", "d", "1", "2", "3", "4", "5"}
+
+
+def send_keys_raw(keys: str, target: str | None = None) -> None:
+    """Send raw keystrokes without Enter (for single-key prompts)."""
+    subprocess.run(["tmux", "send-keys", "-t", target or current_target, "--", keys])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Relay incoming Telegram messages to the tmux pane."""
     if not authorized(update):
         return
-    send_keys(update.message.text)
-    await update.message.reply_text("Sent to Claude.")
+    text = update.message.text.strip()
+    lower = text.lower()
+    # Map common voice-dictated words to single keys
+    if lower in ("yes", "yeah", "yep", "allow"):
+        send_keys_raw("y")
+        await update.message.reply_text("Sent: y")
+    elif lower in ("no", "nope", "deny"):
+        send_keys_raw("n")
+        await update.message.reply_text("Sent: n")
+    elif lower in ("always", "allow always"):
+        send_keys_raw("a")
+        await update.message.reply_text("Sent: a (always allow)")
+    elif len(text) == 1 and lower in SINGLE_KEY_INPUTS:
+        send_keys_raw(text)
+        await update.message.reply_text(f"Sent: {text}")
+    else:
+        # Regular message — send with Enter for Claude's input prompt
+        send_keys(text)
+        await update.message.reply_text("Sent to Claude.")
 
 
 async def handle_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,6 +168,37 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Claude is working...")
 
 
+async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch which tmux pane the bridge monitors."""
+    global current_target
+    if not authorized(update):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(f"Currently watching: {current_target}\n\nUsage: /watch <session:window.pane>\nExample: /watch 0:1\n\nUse /list to see available panes.")
+        return
+    new_target = args[0]
+    # Verify the target exists
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", new_target.split(":")[0].split(".")[0]],
+        capture_output=True,
+    )
+    current_target = new_target
+    # Reset detector so it doesn't carry stale state from the previous pane
+    global _detector
+    _detector = PromptDetector(quiescence_seconds=QUIESCENCE_SECONDS)
+    await update.message.reply_text(f"Now watching: {current_target}")
+
+
+async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all available tmux panes."""
+    if not authorized(update):
+        return
+    panes = list_panes()
+    msg = f"Available panes:\n\n{panes}\n\nCurrently watching: {current_target}\n\nUse /watch <target> to switch."
+    await update.message.reply_text(msg)
+
+
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shut down the bridge."""
     if not authorized(update):
@@ -138,13 +207,16 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sys.exit(0)
 
 
+_detector = None
+
 async def poll_tmux(app) -> None:
     """Poll tmux pane and send Telegram notifications when prompts detected."""
-    detector = PromptDetector(quiescence_seconds=QUIESCENCE_SECONDS)
-    await app.bot.send_message(chat_id=CHAT_ID, text="Bridge connected. Monitoring Claude Code session.")
+    global _detector
+    _detector = PromptDetector(quiescence_seconds=QUIESCENCE_SECONDS)
+    await app.bot.send_message(chat_id=CHAT_ID, text=f"Bridge connected. Watching: {current_target}")
     while True:
         content = capture_pane()
-        context_text = detector.update(content)
+        context_text = _detector.update(content)
         if context_text:
             msg = f"Claude needs your input:\n---\n{context_text}\n---\nReply to respond."
             if len(msg) > 4000:
@@ -153,24 +225,40 @@ async def poll_tmux(app) -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
-async def post_init(app) -> None:
-    """Start the tmux poller after the Telegram bot initializes."""
-    app.create_task(poll_tmux(app))
-
-
 def main() -> None:
     if not BOT_TOKEN or not CHAT_ID:
         print("Error: Set BOT_TOKEN and CHAT_ID in .env")
         sys.exit(1)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("screen", handle_screen))
     app.add_handler(CommandHandler("status", handle_status))
+    app.add_handler(CommandHandler("watch", handle_watch))
+    app.add_handler(CommandHandler("list", handle_list))
     app.add_handler(CommandHandler("stop", handle_stop))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT, handle_message))
 
-    print(f"Bridge starting. Monitoring tmux target: {TMUX_TARGET}")
-    app.run_polling(drop_pending_updates=True)
+    print(f"Bridge starting. Monitoring tmux target: {current_target}")
+
+    async def run() -> None:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            poller_task = asyncio.create_task(poll_tmux(app))
+            print("Bridge running. Press Ctrl+C to stop.")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                poller_task.cancel()
+                await app.updater.stop()
+                await app.stop()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nBridge stopped.")
 
 
 if __name__ == "__main__":
