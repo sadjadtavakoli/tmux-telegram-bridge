@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from bridge import PromptDetector
 
 
@@ -45,3 +47,54 @@ class TestExtractContext:
         content = "line 1\nline 2\n\n"
         result = PromptDetector.extract_context(content)
         assert result == "line 1\nline 2"
+
+
+class TestUpdate:
+    def test_returns_none_on_first_content(self):
+        detector = PromptDetector(quiescence_seconds=0)
+        result = detector.update("Allow this?")
+        assert result is None  # First call is always a content change
+
+    def test_returns_context_when_quiescent_with_prompt(self):
+        detector = PromptDetector(quiescence_seconds=0)
+        detector.update("Allow this?")
+        result = detector.update("Allow this?")
+        assert result is not None
+        assert "Allow this?" in result
+
+    def test_deduplicates_notifications(self):
+        detector = PromptDetector(quiescence_seconds=0)
+        detector.update("Allow this?")
+        detector.update("Allow this?")  # First notification
+        result = detector.update("Allow this?")  # Same content — no re-notify
+        assert result is None
+
+    def test_notifies_again_after_content_changes(self):
+        detector = PromptDetector(quiescence_seconds=0)
+        detector.update("Allow this?")
+        detector.update("Allow this?")  # Notifies
+        detector.update("Working...")  # Content changed
+        detector.update("Allow that?")  # New content
+        result = detector.update("Allow that?")  # New prompt — should notify
+        assert result is not None
+        assert "Allow that?" in result
+
+    def test_no_notification_without_prompt_pattern(self):
+        detector = PromptDetector(quiescence_seconds=0)
+        detector.update("Just regular output")
+        result = detector.update("Just regular output")
+        assert result is None
+
+    @patch("bridge.time.monotonic")
+    def test_respects_quiescence_period(self, mock_time):
+        mock_time.return_value = 100.0
+        detector = PromptDetector(quiescence_seconds=3.0)
+        detector.update("Allow this?")
+
+        mock_time.return_value = 101.0  # 1s later — not quiescent
+        result = detector.update("Allow this?")
+        assert result is None
+
+        mock_time.return_value = 104.0  # 4s later — quiescent
+        result = detector.update("Allow this?")
+        assert result is not None
